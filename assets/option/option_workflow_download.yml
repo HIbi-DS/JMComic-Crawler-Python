@@ -1,36 +1,148 @@
-# GitHub Actions 下载脚本配置
-dir_rule:
-  base_dir: ${JM_DOWNLOAD_DIR}
-  rule: Bd_Aauthor_Atitle_Pindex
+# ============================================================
+# 下载JM本子 (dispatch) —— 修好后的版本
+# 适用仓库：你自己的 fork（如 HIbi-DS/JMComic-Crawler-Python）
+# 放置位置：仓库根目录 .github/workflows/download_dispatch.yml
+# 设计要点：
+#   1) 锁死 jmcomic 版本，不再"每次装最新、悄悄升级把自己装坏"
+#   2) 每次运行自动从上游拉最新的 workflow_download.py（脚本跟着上游走，不再腐烂）
+#   3) 压缩/上传步骤做了空目录保护，没下到东西也不会整步失败
+# ============================================================
+name: 下载JM本子 (dispatch)
 
-client:
-  impl: api # 使用api可免登录下载本子
-  domain:
-    html: [ jmcomic1.me, jmcomic.me ]
+on:
+  workflow_dispatch:
+    inputs:
+      JM_ALBUM_IDS:
+        type: string
+        description: 本子id（多个id用-隔开，如 '123-456-789'）
+        required: false
 
-# 插件配置
-plugins:
-  after_init:
-    - plugin: usage_log # 实时打印硬件占用率的插件
-      kwargs:
-        interval: 0.5 # 间隔时间
-        enable_warning: false # 不告警
+      JM_PHOTO_IDS:
+        type: string
+        description: 章节id（单独下载章节，多个id同上）
+        required: false
 
-    - plugin: client_proxy # 提高移动端的请求效率的插件
-      kwargs:
-        proxy_client_key: photo_concurrent_fetcher_proxy
-        whitelist: [ api, ]
+      CLIENT_IMPL:
+        type: string
+        description: 客户端类型（client.impl）。'api' 表示移动端（默认，不限IP），'html' 表示网页端（限制IP地区但快）。下载失败时可换另一个重试。
+        default: ''
+        required: false
 
-    - plugin: login # 登录插件
-      kwargs:
-        username: ${JM_USERNAME}
-        password: ${JM_PASSWORD}
+      IMAGE_SUFFIX:
+        type: string
+        description: 图片后缀（download.image.suffix）。默认为空表示不做格式转换。可填 'png' 'jpg'
+        default: ''
+        required: false
 
-  after_download: # 全部下载完成以后
-    - plugin: send_qq_email # 发送邮件，如果未配置下面的前3个环境变量则不会发送。
-      kwargs:
-        msg_from: ${EMAIL_FROM}
-        msg_to: ${EMAIL_TO}
-        password: ${EMAIL_PASS}
-        title: ${EMAIL_TITLE}
-        content: ${EMAIL_CONTENT}
+      IMAGE_QUALITY:
+        type: number
+        description: 图片质量 1-100。100 表示不压缩（默认）。不支持后缀为 PNG 的图片，PDF 模式会先转 JPG 再合并。
+        default: 100
+        required: false
+
+      DIR_RULE:
+        type: string
+        description: 下载文件夹规则（dir_rule.rule）。默认使用配置文件的 'Bd_Aauthor_Atitle_Pindex'。
+        default: ''
+        required: false
+
+      ZIP_NAME:
+        type: string
+        default: 本子.tar.gz
+        description: 压缩文件名称
+        required: false
+
+      UPLOAD_NAME:
+        type: string
+        default: Click me to download
+        description: 上传文件名称
+        required: false
+
+env:
+  # ===== 固定值 =====
+  JMCOMIC_VERSION: '2.7.12'          # ← 升级 jmcomic 只改这一行（先看上游 release 说明有无破坏性变更）
+  UPSTREAM_REPO: 'hect0x7/JMComic-Crawler-Python'   # 上游仓库，脚本永远从这里取
+  UPSTREAM_REF: 'master'
+  JM_DOWNLOAD_DIR: /home/runner/work/jmcomic/download/
+  PIP_INDEX_URL: https://pypi.org/simple
+
+  # ===== 工作流输入 =====
+  JM_ALBUM_IDS: ${{ github.event.inputs.JM_ALBUM_IDS }}
+  JM_PHOTO_IDS: ${{ github.event.inputs.JM_PHOTO_IDS }}
+  DIR_RULE: ${{ github.event.inputs.DIR_RULE }}
+  CLIENT_IMPL: ${{ github.event.inputs.CLIENT_IMPL }}
+  IMAGE_SUFFIX: ${{ github.event.inputs.IMAGE_SUFFIX }}
+  IMAGE_QUALITY: ${{ github.event.inputs.IMAGE_QUALITY }}
+  ZIP_NAME: ${{ github.event.inputs.ZIP_NAME }}
+  UPLOAD_NAME: ${{ github.event.inputs.UPLOAD_NAME }}
+
+  # ===== 登录（可选，大部分本子不需要）=====
+  JM_USERNAME: ${{ secrets.JM_USERNAME }}
+  JM_PASSWORD: ${{ secrets.JM_PASSWORD }}
+
+  # ===== 邮件通知（可选，不配就不发）=====
+  EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+  EMAIL_TO: ${{ secrets.EMAIL_TO }}
+  EMAIL_PASS: ${{ secrets.EMAIL_PASS }}
+  EMAIL_TITLE: ${{ secrets.EMAIL_TITLE }}
+  EMAIL_CONTENT: ${{ secrets.EMAIL_CONTENT }}
+
+jobs:
+  crawler:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: 安装 jmcomic（锁定版本）
+        run: |
+          python -m pip install --upgrade pip
+          pip install "jmcomic[plugins]==$JMCOMIC_VERSION"
+
+      - name: Fork 同步上游下载脚本
+        if: ${{ github.repository != env.UPSTREAM_REPO || github.ref_name != env.UPSTREAM_REF }}
+        continue-on-error: true
+        run: |
+          curl --fail --silent --show-error --location \
+            "https://raw.githubusercontent.com/${UPSTREAM_REPO}/${UPSTREAM_REF}/usage/workflow_download.py" \
+            --output usage/upstream_workflow_download.py || true
+
+          if [ -f "usage/upstream_workflow_download.py" ] && [ -s "usage/upstream_workflow_download.py" ]; then
+            mv usage/upstream_workflow_download.py usage/workflow_download.py
+            echo "已同步上游 workflow_download.py"
+          else
+            echo "拉取上游脚本失败，继续使用仓库内已有脚本"
+          fi
+
+      - name: 运行下载脚本
+        run: |
+          cd ./usage/
+          python workflow_download.py
+
+      - name: 压缩文件
+        id: compress
+        run: |
+          if [ ! -d "$JM_DOWNLOAD_DIR" ] || [ -z "$(ls -A "$JM_DOWNLOAD_DIR")" ]; then
+            echo "has_files=false" >> $GITHUB_OUTPUT
+            echo "下载目录不存在或为空，跳过压缩"
+            exit 0
+          fi
+          cd $JM_DOWNLOAD_DIR
+          tar -zcvf "../$ZIP_NAME" ./
+          mv "../$ZIP_NAME" .
+          echo "has_files=true" >> $GITHUB_OUTPUT
+
+      - name: 上传结果
+        if: steps.compress.outputs.has_files == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.UPLOAD_NAME }}
+          path: ${{ env.JM_DOWNLOAD_DIR }}/${{ env.ZIP_NAME }}
+          if-no-files-found: warn
+          retention-days: 90
